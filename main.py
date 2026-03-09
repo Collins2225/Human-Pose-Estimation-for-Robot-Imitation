@@ -89,8 +89,8 @@ class HRISystem:
         print("[3/4] Setting up angle calculator and filter...")
         self.angle_calc = AngleCalculator()
         self.sig_filter = MultiJointFilter()
-        print(f"    Angle calculator ready ✓")
-        print(f"    Signal filter ready ✓\n")
+        print(f"    Angle calculator ready ")
+        print(f"    Signal filter ready \n")
 
         # ── 4. Robot Simulation ───────────────────────────────
         print("[4/4] Starting PyBullet simulation...")
@@ -98,7 +98,7 @@ class HRISystem:
         print()
 
         print("━"*45)
-        print("  ✅ System ready! Controls:")
+        print("   System ready! Controls:")
         print("     Q = Quit   R = Reset robot   P = Pause")
         print("━"*45)
         print("  Stand 1.5–2m from camera with arms visible.\n")
@@ -297,7 +297,7 @@ class HRISystem:
         print(f"│  Average FPS  : {avg_fps:<6.1f}                 │")
         print(f"│  Session time : {duration:<6.1f}s                │")
         print("└───────────────────────────────────────┘")
-        print("Goodbye! 👋")
+        print("Goodbye! ")
 
 
 # ── Entry Point ───────────────────────────────────────────────

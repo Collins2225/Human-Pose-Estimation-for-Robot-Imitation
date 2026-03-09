@@ -300,7 +300,3 @@ if __name__ == "__main__":
     print(f"Test 3 (Expected ~0°): {angle:.1f}°")
 
     print("\nAll tests passed!")
-
-
-# Alias for compatibility with main.py
-JointAngleExtractor = AngleCalculator
