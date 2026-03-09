@@ -1,430 +1,334 @@
-#!/usr/bin/env python3
 """
-════════════════════════════════════════════════════════════════
-pose_detector.py — Real-time Pose Detection Engine
-════════════════════════════════════════════════════════════════
+===================================================================
+MODULE 1: pose_detector.py — Human Pose Detection via MediaPipe
+===================================================================
 
-This module captures video from a webcam and detects human body landmarks
-using MediaPipe's efficient pose estimation model.
+UPDATED FOR MediaPipe 0.10.x+ (New Tasks API)
+Fully compatible — no mp.solutions dependencies.
 
-🎯 CONCEPT EXPLANATION:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-MediaPipe Pose detects 33 body landmarks in 3D space:
-  - Landmarks represent joint positions (nose, shoulders, elbows, etc.)
-  - Each landmark has (x, y, z) coordinates in normalized space
-  - x, y: normalized to [0,1] relative to frame width/height
-  - z: depth relative to the hips (positive = away from camera)
-  - visibility: confidence score that landmark is visible
-
-Key MediaPipe Landmarks for robot control:
-  - Index 11: Left Shoulder  | Index 12: Right Shoulder
-  - Index 13: Left Elbow     | Index 14: Right Elbow
-  - Index 15: Left Wrist     | Index 16: Right Wrist
-  - Index 23: Left Hip       | Index 24: Right Hip
-  - Index 25: Left Knee      | Index 26: Right Knee
-  - Index 27: Left Ankle     | Index 28: Right Ankle
-
-════════════════════════════════════════════════════════════════
+MENTOR EXPLANATION:
+This version removes ALL references to mp.solutions.* which caused
+the AttributeError. Instead we:
+  1. Use the new Tasks API for detection
+  2. Manually define pose connections (the skeleton lines)
+  3. Draw landmarks ourselves using OpenCV directly
+  4. Use only: mp.Image, mp.ImageFormat, mp.tasks — all safe in 0.10.32
+===================================================================
 """
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.vision import RunningMode
 import numpy as np
-from typing import Optional, Tuple, List
+import urllib.request
+import os
+
+
+# ── Model download config ─────────────────────────────────────
+MODEL_FILENAME = "pose_landmarker_full.task"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "pose_landmarker/pose_landmarker_full/float16/latest/"
+    "pose_landmarker_full.task"
+)
+
+# ── Arm landmark indices (from MediaPipe's 33-point model) ────
+ARM_LANDMARK_INDICES = {
+    "left_shoulder":  11,
+    "left_elbow":     13,
+    "left_wrist":     15,
+    "right_shoulder": 12,
+    "right_elbow":    14,
+    "right_wrist":    16,
+    "left_hip":       23,
+    "right_hip":      24,
+}
+
+# ── Skeleton connections (drawn as lines between joint pairs) ──
+# MENTOR NOTE:
+# Each tuple (A, B) means "draw a line from landmark A to landmark B".
+# These cover the full body skeleton. We draw them manually with
+# OpenCV since we no longer use mp.solutions.drawing_utils.
+POSE_CONNECTIONS = [
+    # Face
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),
+    # Shoulders
+    (11, 12),
+    # Left arm
+    (11, 13), (13, 15),
+    # Right arm
+    (12, 14), (14, 16),
+    # Torso
+    (11, 23), (12, 24), (23, 24),
+    # Left leg
+    (23, 25), (25, 27), (27, 29), (29, 31),
+    # Right leg
+    (24, 26), (26, 28), (28, 30), (30, 32),
+]
+
+
+def download_model_if_needed(model_path: str = MODEL_FILENAME) -> str:
+    """Download the .task model file if not already present."""
+    if os.path.exists(model_path):
+        print(f"    Model file found: {model_path} ✓")
+        return model_path
+
+    print(f"    Downloading pose model (~5MB), please wait...")
+    try:
+        urllib.request.urlretrieve(MODEL_URL, model_path)
+        size_mb = os.path.getsize(model_path) / (1024 * 1024)
+        print(f"    Downloaded: {model_path} ({size_mb:.1f} MB) ✓")
+        return model_path
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to download model: {e}\n"
+            f"Please download manually from:\n{MODEL_URL}\n"
+            f"Save it as '{model_path}' in your project folder."
+        )
 
 
 class PoseDetector:
     """
-    Manages real-time pose detection from webcam using MediaPipe.
-    
-    Attributes:
-        confidence_threshold (float): Minimum detection confidence [0-1]
-        frame_width (int): Current frame width
-        frame_height (int): Current frame height
-        landmarks (List): Last detected 33 landmarks [x, y, z, visibility]
+    MediaPipe PoseLandmarker wrapper — fully compatible with 0.10.32+.
+
+    MENTOR NOTE on what changed vs old API:
+    ┌─────────────────────────────────────────────────────────┐
+    │  OLD (broken)          │  NEW (this file)               │
+    ├─────────────────────────────────────────────────────────┤
+    │  mp.solutions.pose     │  mp_vision.PoseLandmarker      │
+    │  mp.solutions.drawing  │  OpenCV draw manually          │
+    │  pose.POSE_CONNECTIONS │  Our POSE_CONNECTIONS list     │
+    │  results.pose_landmarks│  result.pose_landmarks[0]      │
+    └─────────────────────────────────────────────────────────┘
     """
-    
-    def __init__(self, confidence_threshold: float = 0.5):
-        """
-        Initialize MediaPipe Pose detector.
-        
-        Args:
-            confidence_threshold: Minimum confidence to include landmark.
-                                Values too low = noisy detections.
-                                Values too high = missed detections.
-        """
-        self.confidence_threshold = confidence_threshold
-        self.frame_width = None
-        self.frame_height = None
-        self.landmarks = []
-        
-        # Initialize MediaPipe components
-        # ─────────────────────────────────
-        # mp.solutions.pose: The pose estimation model
-        # min_detection_confidence: Initial frame detection threshold
-        # min_tracking_confidence: Threshold for tracking between frames
-        self.mp_pose = mp.solutions.pose
-        self.pose = self.mp_pose.Pose(
-            static_image_mode=False,  # Video mode (tracks landmarks smoothly)
-            model_complexity=1,        # 0=lite, 1=full (use 1 for accuracy)
-            smooth_landmarks=True,     # Temporal smoothing built-in
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+
+    def __init__(self,
+                 min_detection_confidence: float = 0.7,
+                 min_tracking_confidence: float = 0.7,
+                 model_path: str = MODEL_FILENAME):
+
+        # Download model if needed
+        model_path = download_model_if_needed(model_path)
+
+        # Configure the landmarker
+        base_options = mp_python.BaseOptions(model_asset_path=model_path)
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=RunningMode.VIDEO,
+            min_pose_detection_confidence=min_detection_confidence,
+            min_pose_presence_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+            num_poses=1,
+            output_segmentation_masks=False
         )
-        
-        # MediaPipe drawing utilities for visualization
-        self.mp_drawing = mp.solutions.drawing_utils
-        
-        # Define landmark names for easy reference
-        self._setup_landmark_names()
-    
-    
-    def _setup_landmark_names(self):
+        self.landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+
+        # Skeleton connections (no mp.solutions dependency)
+        self.pose_connections = POSE_CONNECTIONS
+
+        # Timestamp: VIDEO mode needs monotonically increasing value
+        # We simulate 30fps → increment 33ms each frame
+        self._timestamp_ms = 0
+
+        # Last known result for stability when detection is lost
+        self._last_result = None
+
+        print("    PoseDetector ready (MediaPipe 0.10.32 compatible) ✓")
+
+    def detect(self, frame: np.ndarray):
         """
-        Create mapping of landmark indices to human-readable names.
-        
-        This helps identify key joints later for angle extraction.
-        Full list: 33 landmarks total (indices 0-32)
-        """
-        self.landmark_names = {
-            0: "Nose",
-            1: "Left Eye Inner", 2: "Left Eye", 3: "Left Eye Outer",
-            4: "Right Eye Inner", 5: "Right Eye", 6: "Right Eye Outer",
-            7: "Left Ear", 8: "Right Ear",
-            9: "Mouth Left", 10: "Mouth Right",
-            11: "Left Shoulder", 12: "Right Shoulder",
-            13: "Left Elbow", 14: "Right Elbow",
-            15: "Left Wrist", 16: "Right Wrist",
-            17: "Left Pinky", 18: "Right Pinky",
-            19: "Left Index", 20: "Right Index",
-            21: "Left Thumb", 22: "Right Thumb",
-            23: "Left Hip", 24: "Right Hip",
-            25: "Left Knee", 26: "Right Knee",
-            27: "Left Ankle", 28: "Right Ankle",
-            29: "Left Heel", 30: "Right Heel",
-            31: "Left Foot Index", 32: "Right Foot Index"
-        }
-    
-    
-    def detect(self, frame: np.ndarray) -> bool:
-        """
-        Detect human pose landmarks in the current frame.
-        
+        Run pose detection on one frame and store the result.
+
+        MENTOR NOTE:
+        We separate detection (this method) from drawing and landmark
+        extraction. This makes the code cleaner and easier to test —
+        you can call detect() then decide whether to draw or just
+        extract landmarks depending on what you need.
+
         Args:
-            frame: Input video frame (BGR format from OpenCV)
-            
+            frame: BGR image from OpenCV
+        """
+        self._timestamp_ms += 33
+
+        # BGR → RGB → MediaPipe Image
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        # Detect landmarks
+        result = self.landmarker.detect_for_video(mp_image, self._timestamp_ms)
+
+        # Store result if valid, otherwise keep last known
+        if result.pose_landmarks and len(result.pose_landmarks) > 0:
+            self._last_result = result
+        # If no detection, self._last_result stays as-is (stability)
+
+    def get_landmarks(self) -> dict | None:
+        """
+        Extract arm joint positions from the last detection result.
+
+        MENTOR NOTE:
+        Returns normalized (0.0–1.0) x, y coordinates — NOT pixels yet.
+        We convert to pixels in process_frame() using the frame dimensions.
+        Keeping them normalized here makes the class more reusable.
+
         Returns:
-            True if landmarks detected successfully, False otherwise
-            
-        HOW IT WORKS:
-        ─────────────
-        1. Convert BGR (OpenCV) → RGB (MediaPipe requirement)
-        2. Run inference: mediapipe.process() detects all 33 landmarks
-        3. Extract landmark data with confidence filtering
-        4. Store for later use by other modules
+            Dict {joint_name: np.array([x_norm, y_norm, z_m])} or None
         """
-        if frame is None:
-            return False
-        
-        # Store frame dimensions for coordinate conversion later
-        self.frame_height, self.frame_width = frame.shape[:2]
-        
-        # MediaPipe requires RGB format
-        # ──────────────────────────────
-        # cv2.imread() uses BGR by default, so we convert
-        # This is CRITICAL - wrong format causes silent failures!
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        
-        # Run pose estimation
-        # ───────────────────
-        # The pose model is already optimized to handle 30 FPS+ on CPU
-        # Results include landmarks + world_landmarks
-        # world_landmarks: 3D coordinates in meters (relative to center of hips)
-        results = self.pose.process(rgb_frame)
-        
-        # Check if landmarks were detected
-        if not results.landmarks:
-            self.landmarks = []
-            return False
-        
-        # Extract landmark data
-        # ────────────────────
-        # Each landmark is a Landmark object with x, y, z, visibility
-        # We filter by confidence to avoid using weak detections
-        self.landmarks = []
-        for landmark in results.landmarks:
-            if landmark.visibility >= self.confidence_threshold:
-                self.landmarks.append({
-                    'x': landmark.x,
-                    'y': landmark.y,
-                    'z': landmark.z,
-                    'visibility': landmark.visibility
-                })
-            else:
-                # Landmark below confidence threshold
-                self.landmarks.append({
-                    'x': None,
-                    'y': None,
-                    'z': None,
-                    'visibility': landmark.visibility
-                })
-        
-        return len(self.landmarks) > 0
-    
-    
-    def get_landmarks(self) -> List[dict]:
-        """
-        Get all detected landmarks from last frame.
-        
-        Returns:
-            List of 33 landmark dictionaries with keys: x, y, z, visibility
-            Landmarks not detected will have None values.
-        """
-        return self.landmarks
-    
-    
-    def get_landmark(self, idx: int) -> Optional[Tuple[float, float, float]]:
-        """
-        Get specific landmark coordinates by index.
-        
-        Args:
-            idx: Landmark index (0-32)
-            
-        Returns:
-            (x, y, z) tuple if detected, None if not detected
-            
-        Example:
-            left_shoulder = detector.get_landmark(11)
-        """
-        if idx >= len(self.landmarks):
+        if self._last_result is None:
             return None
-        
-        lm = self.landmarks[idx]
-        if lm['x'] is None:
-            return None
-        
-        return (lm['x'], lm['y'], lm['z'])
-    
-    
-    def get_landmark_pixel(self, idx: int) -> Optional[Tuple[int, int]]:
+
+        pose_landmarks = self._last_result.pose_landmarks[0]
+        landmarks = {}
+        for name, idx in ARM_LANDMARK_INDICES.items():
+            lm = pose_landmarks[idx]
+            landmarks[name] = np.array([lm.x, lm.y, lm.z])
+        return landmarks
+
+    def draw_landmarks(self, frame: np.ndarray):
         """
-        Get landmark in pixel coordinates (for drawing on frame).
-        
+        Draw the full body skeleton on the frame using OpenCV.
+
+        MENTOR NOTE on manual drawing:
+        Since we removed mp.solutions.drawing_utils, we draw ourselves:
+          1. Loop through all 33 landmarks → draw a green circle at each
+          2. Loop through POSE_CONNECTIONS → draw a white line for each bone
+
+        This gives us full control over colors, thickness, and style —
+        and removes the dependency that was causing AttributeErrors.
+
         Args:
-            idx: Landmark index (0-32)
-            
-        Returns:
-            (pixel_x, pixel_y) tuple, or None if not detected
-            
-        WHY NEEDED:
-        ───────────
-        MediaPipe returns normalized coordinates [0,1].
-        To draw on screen, we need pixel coordinates [0, width/height].
+            frame: BGR image to draw on (modified in place)
         """
-        lm = self.get_landmark(idx)
-        if lm is None:
-            return None
-        
-        x_pixel = int(lm[0] * self.frame_width)
-        y_pixel = int(lm[1] * self.frame_height)
-        
-        # Clamp to frame boundaries (safety check)
-        x_pixel = max(0, min(x_pixel, self.frame_width - 1))
-        y_pixel = max(0, min(y_pixel, self.frame_height - 1))
-        
-        return (x_pixel, y_pixel)
-    
-    
-    def draw_landmarks(self, frame: np.ndarray, 
-                      draw_connections: bool = True) -> np.ndarray:
+        if self._last_result is None:
+            return
+
+        h, w = frame.shape[:2]
+        pose_landmarks = self._last_result.pose_landmarks[0]
+
+        # Convert all 33 landmarks to pixel coordinates
+        points = []
+        for lm in pose_landmarks:
+            x = int(lm.x * w)
+            y = int(lm.y * h)
+            points.append((x, y))
+
+        # Draw skeleton lines (bones)
+        for start_idx, end_idx in self.pose_connections:
+            if start_idx < len(points) and end_idx < len(points):
+                start_pt = points[start_idx]
+                end_pt   = points[end_idx]
+                cv2.line(frame, start_pt, end_pt, (255, 255, 255), 2)
+
+        # Draw joint dots on top of lines
+        for (x, y) in points:
+            cv2.circle(frame, (x, y), 4, (0, 255, 0), -1)   # Filled green dot
+            cv2.circle(frame, (x, y), 4, (0, 180, 0), 1)    # Dark green border
+
+    def process_frame(self, frame: np.ndarray) -> tuple:
         """
-        Draw detected landmarks and skeleton on frame.
-        
+        Full pipeline: detect → draw → extract landmarks.
+
+        This is the main method called by main.py every frame.
+
         Args:
-            frame: Input frame to draw on
-            draw_connections: Whether to draw lines connecting joints
-            
+            frame: BGR webcam frame
+
         Returns:
-            Frame with landmarks drawn
-            
-        VISUAL GUIDE:
-        ─────────────
-        Green circles = detected landmarks
-        Blue lines = connections (skeleton structure)
-        Red circles = low confidence detections
+            annotated_frame: Frame with skeleton overlay
+            landmarks: Dict {joint_name: np.array([x_px, y_px, z])} or None
         """
-        output_frame = frame.copy()
-        
-        # Draw individual landmarks
-        for idx, landmark in enumerate(self.landmarks):
-            if landmark['x'] is None:
-                continue
-            
-            pixel_pos = self.get_landmark_pixel(idx)
-            if pixel_pos is None:
-                continue
-            
-            # Color based on confidence
-            confidence = landmark['visibility']
-            if confidence > 0.7:
-                color = (0, 255, 0)  # Green = high confidence
-            else:
-                color = (0, 0, 255)  # Red = medium confidence
-            
-            # Draw circle at joint
-            cv2.circle(output_frame, pixel_pos, 4, color, -1)
-        
-        # Draw skeleton connections (lines between joints)
-        if draw_connections:
-            # MediaPipe defines connections as part of its model metadata
-            # Access them via the Pose model
-            for connection in self.mp_pose.POSE_CONNECTIONS:
-                start_idx, end_idx = connection
-                
-                start_pos = self.get_landmark_pixel(start_idx)
-                end_pos = self.get_landmark_pixel(end_idx)
-                
-                if start_pos is None or end_pos is None:
-                    continue
-                
-                # Blue line connecting joints
-                cv2.line(output_frame, start_pos, end_pos, (255, 0, 0), 2)
-        
-        return output_frame
-    
-    
-    def distance_between_landmarks(self, idx1: int, idx2: int) -> Optional[float]:
-        """
-        Calculate Euclidean distance between two landmarks.
-        
-        Args:
-            idx1, idx2: Landmark indices
-            
-        Returns:
-            Distance in normalized space [0-1.41], or None if either not detected
-            
-        USE CASE:
-        ─────────
-        Measure arm length: distance_between_landmarks(11, 15)
-        (shoulder to wrist distance)
-        """
-        lm1 = self.get_landmark(idx1)
-        lm2 = self.get_landmark(idx2)
-        
-        if lm1 is None or lm2 is None:
-            return None
-        
-        dx = lm1[0] - lm2[0]
-        dy = lm1[1] - lm2[1]
-        dz = lm1[2] - lm2[2]
-        
-        distance = np.sqrt(dx**2 + dy**2 + dz**2)
-        return distance
-    
-    
-    def close(self):
-        """
-        Close video capture and MediaPipe resources.
-        Always call this when done to free system resources.
-        """
-        self.pose.close()
+        # Run detection
+        self.detect(frame)
+
+        # Draw skeleton on a copy
+        annotated_frame = frame.copy()
+        self.draw_landmarks(annotated_frame)
+
+        # Extract and convert landmarks to pixel coordinates
+        norm_landmarks = self.get_landmarks()
+        if norm_landmarks is None:
+            return annotated_frame, None
+
+        h, w = frame.shape[:2]
+        pixel_landmarks = {}
+        for name, coords in norm_landmarks.items():
+            pixel_landmarks[name] = np.array([
+                coords[0] * w,   # x in pixels
+                coords[1] * h,   # y in pixels
+                coords[2]        # z in meters (keep as-is)
+            ])
+
+        return annotated_frame, pixel_landmarks
+
+    def release(self):
+        """Clean up MediaPipe resources."""
+        self.landmarker.close()
 
 
-# ════════════════════════════════════════════════════════════════
-# Example Usage Section
-# ════════════════════════════════════════════════════════════════
+# ── Quick Test ────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("="*50)
+    print("  Pose Detector Test (MediaPipe 0.10.32+)")
+    print("="*50)
+    print("Stand in front of your camera.")
+    print("Press Q to quit.\n")
 
-def demo_pose_detection():
-    """
-    Demonstration: Real-time pose detection from webcam.
-    
-    Shows:
-    - Webcam feed with detected landmarks
-    - FPS counter
-    - Joint coordinates on screen
-    
-    Controls:
-    - Press 'Q' to quit
-    - Press 'S' to show statistics
-    """
-    print("🎥 Starting pose detection demo...")
-    print("   Press 'Q' to quit, 'S' for stats\n")
-    
-    # Initialize detector
-    detector = PoseDetector(confidence_threshold=0.5)
-    
-    # Open webcam (0 = default camera)
+    detector = PoseDetector()
     cap = cv2.VideoCapture(0)
-    
+
     if not cap.isOpened():
-        print(" Error: Could not open webcam!")
-        return
-    
-    # Get camera properties
-    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    print(f"   Camera: {frame_width}x{frame_height} @ {fps} FPS\n")
-    
-    # Real-time loop
+        print("ERROR: Could not open webcam. Try changing index to 1.")
+        exit(1)
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
     frame_count = 0
-    import time
-    start_time = time.time()
-    
     while True:
         ret, frame = cap.read()
-        
         if not ret:
-            print(" Error reading frame")
+            print("Failed to read frame.")
             break
-        
-        # Detect pose
-        success = detector.detect(frame)
-        
-        # Prepare display frame
-        display_frame = detector.draw_landmarks(frame)
-        
-        # Add FPS counter
+
+        frame = cv2.flip(frame, 1)  # Mirror
+        annotated, landmarks = detector.process_frame(frame)
         frame_count += 1
-        elapsed = time.time() - start_time
-        current_fps = frame_count / elapsed if elapsed > 0 else 0
-        
-        cv2.putText(display_frame, f"FPS: {current_fps:.1f}", (10, 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        
-        # Add status
-        status = "✓ DETECTED" if success else "✗ No Detection"
-        color = (0, 255, 0) if success else (0, 0, 255)
-        cv2.putText(display_frame, status, (10, 70),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-        
-        # Add key joint info
-        left_shoulder = detector.get_landmark_pixel(11)
-        if left_shoulder:
-            cv2.putText(display_frame, "L-Shoulder", 
-                       (left_shoulder[0] - 30, left_shoulder[1] - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-        
-        # Display
-        cv2.imshow("Pose Detection - Press Q to quit", display_frame)
-        
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("\n✓ Exiting...")
+
+        # Print joint positions every 10 frames
+        if landmarks and frame_count % 10 == 0:
+            ls = landmarks["left_shoulder"]
+            le = landmarks["left_elbow"]
+            lw = landmarks["left_wrist"]
+            print(
+                f"  L.Shoulder:({ls[0]:.0f},{ls[1]:.0f})  "
+                f"L.Elbow:({le[0]:.0f},{le[1]:.0f})  "
+                f"L.Wrist:({lw[0]:.0f},{lw[1]:.0f})",
+                end="\r"
+            )
+
+        # Status overlay
+        if landmarks:
+            status, color = "DETECTED ✓", (0, 220, 0)
+        else:
+            status, color = "NO PERSON DETECTED", (0, 60, 255)
+
+        cv2.putText(annotated, status, (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        cv2.putText(annotated, "Q = quit", (10, 465),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
+        cv2.putText(annotated, f"Frame: {frame_count}", (520, 465),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (140, 140, 140), 1)
+
+        cv2.imshow("Pose Detector Test", annotated)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
-        elif key == ord('s'):
-            # Print statistics
-            if detector.landmarks:
-                detected_count = sum(1 for lm in detector.landmarks if lm['x'] is not None)
-                print(f"   Detected landmarks: {detected_count}/33")
-    
-    # Cleanup
+
+    print("\n\nCleaning up...")
+    detector.release()
     cap.release()
-    detector.close()
     cv2.destroyAllWindows()
-    print("✓ Demo ended\n")
-
-
-if __name__ == "__main__":
-    demo_pose_detection()
+    print("Done!")
